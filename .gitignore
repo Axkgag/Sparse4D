@@ -1,3 +1,11 @@
 *.pyc
 *.npy
 *.pth
+*.pkl
+*.so
+*.o
+
+__pycache__/
+logs/
+/data
+.vscode/
