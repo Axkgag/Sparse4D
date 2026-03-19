@@ -4,8 +4,9 @@
 *.pkl
 *.so
 *.o
-
+/work_dirs
 __pycache__/
 logs/
 /data
 .vscode/
+/projects/mmdet3d_plugin/ops

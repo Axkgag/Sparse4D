@@ -62,9 +62,9 @@ cam_names = [
 ]
 
 # Point these to your ODD roots.
-train_data_root = "data/aimotive/train"
-val_data_root = "data/aimotive/val"
-test_data_root = "data/aimotive/val"
+train_data_root = "data/aimotive_tl_ts"
+val_data_root = "data/aimotive_tl_ts"
+test_data_root = "data/aimotive_tl_ts"
 
 # ================== model ========================
 embed_dims = 256
