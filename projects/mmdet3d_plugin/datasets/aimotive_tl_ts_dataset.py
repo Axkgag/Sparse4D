@@ -651,10 +651,14 @@ class AiMotiveTLTSDataset(Dataset):
         if "RT_ECEF_body" in entry:
             mat = np.asarray(entry["RT_ECEF_body"], dtype=np.float32)
             if mat.shape == (4, 4):
+                mat = mat.copy()
+                mat[:3, :3] = AiMotiveTLTSDataset._orthonormalize_rotation(mat[:3, :3])
                 return mat
         if "matrix" in entry:
             mat = np.asarray(entry["matrix"], dtype=np.float32)
             if mat.shape == (4, 4):
+                mat = mat.copy()
+                mat[:3, :3] = AiMotiveTLTSDataset._orthonormalize_rotation(mat[:3, :3])
                 return mat
 
         trans = None
@@ -678,6 +682,22 @@ class AiMotiveTLTSDataset(Dataset):
         return pose
 
     @staticmethod
+    def _orthonormalize_rotation(rot: np.ndarray) -> np.ndarray:
+        """Project a near-rotation matrix to SO(3) using SVD."""
+        rot = np.asarray(rot, dtype=np.float64)
+        u, _, vh = np.linalg.svd(rot)
+        r = u @ vh
+        if np.linalg.det(r) < 0:
+            u[:, -1] *= -1
+            r = u @ vh
+        return r.astype(np.float32)
+
+    @staticmethod
     def _rotmat_to_quat(rot: np.ndarray) -> List[float]:
-        q = pyquaternion.Quaternion(matrix=rot)
-        return [q.w, q.x, q.y, q.z]
+        try:
+            rot = AiMotiveTLTSDataset._orthonormalize_rotation(rot)
+            q = pyquaternion.Quaternion(matrix=rot)
+            return [q.w, q.x, q.y, q.z]
+        except Exception:
+            # Fallback to identity rotation to keep dataloader robust.
+            return [1.0, 0.0, 0.0, 0.0]
