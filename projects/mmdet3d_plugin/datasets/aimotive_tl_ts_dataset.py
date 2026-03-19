@@ -27,10 +27,18 @@ class AiMotiveTLTSDataset(Dataset):
         "F_LONGRANGECAM_C",
         "F_MIDRANGECAM_C",
     ]
+    TL_COLOR_TO_CLASS = {
+        ("red", "unknown", "unknown"): "red",
+        ("red", "yellow", "unknown"): "red_yellow",
+        ("unknown", "yellow", "unknown"): "yellow",
+        ("unknown", "unknown", "green"): "green",
+        ("unknown", "unknown", "unknown"): "unknown",
+    }
 
     def __init__(
         self,
         data_root: str,
+        ann_file: Optional[str] = None,
         pipeline: Optional[List[Dict]] = None,
         object_type: str = "traffic_light",
         classes: Optional[List[str]] = None,
@@ -41,6 +49,7 @@ class AiMotiveTLTSDataset(Dataset):
         with_seq_flag: bool = False,
         sequences_split_num: int = 1,
         keep_consistent_seq_aug: bool = True,
+        lazy_init: bool = False,
     ):
         super().__init__()
         assert object_type in [
@@ -48,6 +57,7 @@ class AiMotiveTLTSDataset(Dataset):
             "traffic_sign",
         ], f"Unsupported object_type={object_type}"
         self.data_root = data_root
+        self.ann_file = ann_file
         self.object_type = object_type
         self.test_mode = test_mode
         self.load_interval = load_interval
@@ -64,7 +74,13 @@ class AiMotiveTLTSDataset(Dataset):
         self.cat2id = {name: i for i, name in enumerate(self.CLASSES)}
 
         self.pipeline = Compose(pipeline) if pipeline is not None else None
-        self.data_infos = self._build_infos()
+        self.metadata = {}
+        if lazy_init:
+            self.data_infos = []
+        elif self.ann_file is not None:
+            self.data_infos = self.load_annotations(self.ann_file)
+        else:
+            self.data_infos = self._build_infos()
 
         if self.with_seq_flag:
             self._set_sequence_group_flag()
@@ -72,25 +88,66 @@ class AiMotiveTLTSDataset(Dataset):
     @staticmethod
     def _default_classes(object_type: str) -> Tuple[str, ...]:
         if object_type == "traffic_light":
-            return ("red", "yellow", "green", "off", "unknown")
-        return (
-            "speed_limit",
-            "yield",
-            "stop",
-            "no_entry",
-            "priority",
-            "unknown",
-        )
+            return ("red", "red_yellow", "yellow", "green", "unknown")
+        return ("unknown",)
 
     def __len__(self) -> int:
         return len(self.data_infos)
+
+    def load_annotations(self, ann_file: str) -> List[Dict]:
+        data = mmcv.load(ann_file)
+        if isinstance(data, dict) and "infos" in data:
+            infos = data["infos"]
+            self.metadata = data.get("metadata", {})
+        elif isinstance(data, list):
+            infos = data
+            self.metadata = {}
+        else:
+            raise ValueError(f"Invalid annotation format in ann_file={ann_file}")
+
+        norm_infos = []
+        for info in infos:
+            info = dict(info)
+            if "img_filename" in info:
+                info["img_filename"] = [
+                    self._resolve_path(x) for x in info["img_filename"]
+                ]
+
+            for key in ["lidar2img", "cam_intrinsic"]:
+                if key in info:
+                    info[key] = [np.asarray(x, dtype=np.float32) for x in info[key]]
+
+            if "lidar2global" in info:
+                info["lidar2global"] = np.asarray(info["lidar2global"], dtype=np.float32)
+            else:
+                info["lidar2global"] = np.eye(4, dtype=np.float32)
+
+            if "gt_bboxes_3d" in info and info["gt_bboxes_3d"] is not None:
+                info["gt_bboxes_3d"] = np.asarray(info["gt_bboxes_3d"], dtype=np.float32)
+            if "gt_labels_3d" in info and info["gt_labels_3d"] is not None:
+                info["gt_labels_3d"] = np.asarray(info["gt_labels_3d"], dtype=np.int64)
+            if "gt_names" in info and info["gt_names"] is not None:
+                info["gt_names"] = np.asarray(info["gt_names"], dtype=object)
+
+            norm_infos.append(info)
+
+        norm_infos = norm_infos[:: self.load_interval]
+        return norm_infos
+
+    def _resolve_path(self, path: str) -> str:
+        if os.path.isabs(path):
+            return path
+        return os.path.join(self.data_root, path)
 
     def _set_sequence_group_flag(self):
         flags = []
         curr = 0
         prev_seq = None
         for info in self.data_infos:
-            seq = info["sequence_id"]
+            seq = info.get("sequence_id")
+            if seq is None:
+                sample_idx = str(info.get("sample_idx", ""))
+                seq = sample_idx.rsplit("_", 1)[0]
             if prev_seq is not None and seq != prev_seq:
                 curr += 1
             flags.append(curr)
@@ -227,7 +284,7 @@ class AiMotiveTLTSDataset(Dataset):
         return sequence_dirs
 
     def _build_sequence_infos(self, seq_dir: str) -> List[Dict]:
-        sequence_id = os.path.basename(seq_dir)
+        sequence_id = os.path.relpath(seq_dir, self.data_root).replace(os.sep, "/")
         sensor_dir = os.path.join(seq_dir, "sensor")
         camera_dir = os.path.join(sensor_dir, "camera")
         calib_dir = os.path.join(sensor_dir, "calibration")
@@ -277,7 +334,7 @@ class AiMotiveTLTSDataset(Dataset):
                     "sequence_id": sequence_id,
                     "sample_idx": f"{sequence_id}_{frame_idx:07d}",
                     "timestamp": float(frame_idx),
-                    "img_filename": img_filenames,
+                    "img_filename": [os.path.relpath(x, self.data_root) for x in img_filenames],
                     "lidar2img": lidar2img,
                     "cam_intrinsic": cam_intrinsic,
                     "lidar2global": lidar2global,
@@ -330,7 +387,9 @@ class AiMotiveTLTSDataset(Dataset):
         data = mmcv.load(frame_json_path)
         objects = []
         if isinstance(data, dict):
-            if "objects" in data and isinstance(data["objects"], list):
+            if "CapturedObjects" in data and isinstance(data["CapturedObjects"], list):
+                objects = data["CapturedObjects"]
+            elif "objects" in data and isinstance(data["objects"], list):
                 objects = data["objects"]
             elif "annotations" in data and isinstance(data["annotations"], list):
                 objects = data["annotations"]
@@ -347,6 +406,8 @@ class AiMotiveTLTSDataset(Dataset):
             if box is None:
                 continue
             name = self._obj_to_class_name(obj)
+            if name not in self.cat2id and "unknown" in self.cat2id:
+                name = "unknown"
             label = self.cat2id.get(name, -1)
             if label < 0:
                 continue
@@ -369,6 +430,14 @@ class AiMotiveTLTSDataset(Dataset):
 
     def _obj_to_class_name(self, obj: Dict) -> str:
         if self.object_type == "traffic_light":
+            lights = []
+            if isinstance(obj.get("ObjectMeta"), dict):
+                lights = obj["ObjectMeta"].get("Lights", [])
+            if isinstance(lights, list) and len(lights) >= 3:
+                key = tuple(str(x.get("color", "unknown")).lower() for x in lights[:3])
+                if key in self.TL_COLOR_TO_CLASS:
+                    return self.TL_COLOR_TO_CLASS[key]
+
             color = "unknown"
             if isinstance(obj.get("ObjectMeta"), dict):
                 color = (
@@ -384,14 +453,16 @@ class AiMotiveTLTSDataset(Dataset):
                 return "yellow"
             if "green" in color:
                 return "green"
-            if "off" in color or "dark" in color:
-                return "off"
             return "unknown"
 
         subtype = "unknown"
         if isinstance(obj.get("ObjectMeta"), dict):
             subtype = obj["ObjectMeta"].get("SubType", "unknown")
         subtype = str(subtype).lower()
+        if subtype in self.cat2id:
+            return subtype
+
+        # Backward-compatible fallback for coarse sign taxonomies.
         if "speed" in subtype:
             return "speed_limit"
         if "yield" in subtype:
@@ -402,7 +473,7 @@ class AiMotiveTLTSDataset(Dataset):
             return "no_entry"
         if "priority" in subtype:
             return "priority"
-        return "unknown"
+        return subtype
 
     @staticmethod
     def _obj_to_box(obj: Dict) -> Optional[List[float]]:
@@ -430,7 +501,7 @@ class AiMotiveTLTSDataset(Dataset):
     def _identity_cam_calib() -> Dict:
         return {
             "K": np.eye(3, dtype=np.float32),
-            "T_cam_to_ego": np.eye(4, dtype=np.float32),
+            "T_ego_to_cam": np.eye(4, dtype=np.float32),
         }
 
     def _build_camera_mats(
@@ -440,8 +511,11 @@ class AiMotiveTLTSDataset(Dataset):
         intrinsic_list = []
         for calib in cam_calibs:
             K = np.asarray(calib["K"], dtype=np.float32)
-            T_cam_to_ego = np.asarray(calib["T_cam_to_ego"], dtype=np.float32)
-            T_ego_to_cam = np.linalg.inv(T_cam_to_ego)
+            if "T_ego_to_cam" in calib:
+                T_ego_to_cam = np.asarray(calib["T_ego_to_cam"], dtype=np.float32)
+            else:
+                T_cam_to_ego = np.asarray(calib["T_cam_to_ego"], dtype=np.float32)
+                T_ego_to_cam = np.linalg.inv(T_cam_to_ego)
 
             viewpad = np.eye(4, dtype=np.float32)
             viewpad[:3, :3] = K
@@ -463,37 +537,42 @@ class AiMotiveTLTSDataset(Dataset):
 
         for cam_name in self.cam_order:
             K = self._parse_intrinsic(calib_data, cam_name)
-            T_cam_to_ego = self._parse_extrinsic(extr_data, calib_data, cam_name)
+            T_ego_to_cam = self._parse_extrinsic(extr_data, calib_data, cam_name)
             calibration[cam_name] = {
                 "K": K,
-                "T_cam_to_ego": T_cam_to_ego,
+                "T_ego_to_cam": T_ego_to_cam,
             }
         return calibration
 
     @staticmethod
     def _parse_intrinsic(calib_data: Dict, cam_name: str) -> np.ndarray:
-        candidates = [
-            calib_data.get("camera", {}).get(cam_name, {}),
-            calib_data.get(cam_name, {}),
-        ]
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            for key in ["K", "intrinsic", "camera_matrix", "cam_intrinsic"]:
-                if key in item:
-                    mat = np.asarray(item[key], dtype=np.float32)
-                    if mat.shape == (3, 3):
-                        return mat
-                    if mat.shape == (4, 4):
-                        return mat[:3, :3]
+        item = calib_data.get(cam_name, {}) if isinstance(calib_data, dict) else {}
+        if isinstance(item, dict):
+            if "K" in item:
+                mat = np.asarray(item["K"], dtype=np.float32)
+                if mat.shape == (3, 3):
+                    return mat
+            if "intrinsic" in item:
+                mat = np.asarray(item["intrinsic"], dtype=np.float32)
+                if mat.shape == (3, 3):
+                    return mat
+            if "focal_length_px" in item and "principal_point_px" in item:
+                fx, fy = item["focal_length_px"]
+                cx, cy = item["principal_point_px"]
+                K = np.array(
+                    [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                    dtype=np.float32,
+                )
+                return K
         return np.eye(3, dtype=np.float32)
 
     @staticmethod
     def _parse_extrinsic(extr_data: Dict, calib_data: Dict, cam_name: str) -> np.ndarray:
+        key = f"RT_{cam_name}_from_body"
         candidates = [
-            extr_data.get(cam_name),
-            extr_data.get("camera", {}).get(cam_name) if isinstance(extr_data.get("camera"), dict) else None,
-            calib_data.get("camera", {}).get(cam_name, {}).get("extrinsic") if isinstance(calib_data.get("camera"), dict) else None,
+            extr_data.get(key) if isinstance(extr_data, dict) else None,
+            extr_data.get(cam_name) if isinstance(extr_data, dict) else None,
+            calib_data.get(cam_name, {}).get("RT_sensor_from_body") if isinstance(calib_data.get(cam_name), dict) else None,
             calib_data.get(cam_name, {}).get("extrinsic") if isinstance(calib_data.get(cam_name), dict) else None,
         ]
         for c in candidates:
@@ -512,22 +591,42 @@ class AiMotiveTLTSDataset(Dataset):
         if not os.path.exists(ego_path):
             return {}
         data = mmcv.load(ego_path)
-        entries = []
-        if isinstance(data, list):
-            entries = data
-        elif isinstance(data, dict):
+
+        pose_map = {}
+        if isinstance(data, dict):
+            # Official format: {"206": {"RT_ECEF_body": [[...]] , ...}, ...}
+            if all(isinstance(v, dict) for v in data.values()):
+                for k, v in data.items():
+                    try:
+                        frame_idx = int(k)
+                    except Exception:
+                        frame_idx = self._extract_pose_frame_idx(v)
+                    if frame_idx is None:
+                        continue
+                    pose = self._entry_to_pose(v)
+                    pose_map[frame_idx] = pose
+                return pose_map
+
+            entries = []
             for key in ["frames", "egomotion", "poses", "data"]:
                 if key in data and isinstance(data[key], list):
                     entries = data[key]
                     break
+            for entry in entries:
+                frame_idx = self._extract_pose_frame_idx(entry)
+                if frame_idx is None:
+                    continue
+                pose = self._entry_to_pose(entry)
+                pose_map[frame_idx] = pose
+            return pose_map
 
-        pose_map = {}
-        for entry in entries:
-            frame_idx = self._extract_pose_frame_idx(entry)
-            if frame_idx is None:
-                continue
-            pose = self._entry_to_pose(entry)
-            pose_map[frame_idx] = pose
+        if isinstance(data, list):
+            for entry in data:
+                frame_idx = self._extract_pose_frame_idx(entry)
+                if frame_idx is None:
+                    continue
+                pose = self._entry_to_pose(entry)
+                pose_map[frame_idx] = pose
         return pose_map
 
     @staticmethod
@@ -538,7 +637,7 @@ class AiMotiveTLTSDataset(Dataset):
                     return int(entry[key])
                 except Exception:
                     pass
-        for key in ["timestamp", "image_timestamp", "camera_timestamp"]:
+        for key in ["timestamp", "image_timestamp", "camera_timestamp", "time", "time_host"]:
             if key in entry:
                 try:
                     return int(entry[key])
@@ -549,6 +648,10 @@ class AiMotiveTLTSDataset(Dataset):
     @staticmethod
     def _entry_to_pose(entry: Dict) -> np.ndarray:
         pose = np.eye(4, dtype=np.float32)
+        if "RT_ECEF_body" in entry:
+            mat = np.asarray(entry["RT_ECEF_body"], dtype=np.float32)
+            if mat.shape == (4, 4):
+                return mat
         if "matrix" in entry:
             mat = np.asarray(entry["matrix"], dtype=np.float32)
             if mat.shape == (4, 4):
