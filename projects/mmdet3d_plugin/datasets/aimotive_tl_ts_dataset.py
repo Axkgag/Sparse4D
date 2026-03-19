@@ -128,6 +128,10 @@ class AiMotiveTLTSDataset(Dataset):
                 info["gt_labels_3d"] = np.asarray(info["gt_labels_3d"], dtype=np.int64)
             if "gt_names" in info and info["gt_names"] is not None:
                 info["gt_names"] = np.asarray(info["gt_names"], dtype=object)
+            if "instance_inds" in info and info["instance_inds"] is not None:
+                info["instance_inds"] = np.asarray(
+                    info["instance_inds"], dtype=np.int64
+                )
 
             norm_infos.append(info)
 
@@ -237,16 +241,24 @@ class AiMotiveTLTSDataset(Dataset):
         gt_bboxes_3d = info.get("gt_bboxes_3d")
         gt_labels_3d = info.get("gt_labels_3d")
         gt_names = info.get("gt_names")
+        instance_inds = info.get("instance_inds")
 
         if gt_bboxes_3d is None:
             gt_bboxes_3d = np.zeros((0, 9), dtype=np.float32)
             gt_labels_3d = np.zeros((0,), dtype=np.int64)
             gt_names = np.array([], dtype=object)
+            instance_inds = np.zeros((0,), dtype=np.int64)
+        elif instance_inds is None:
+            # Ensure downstream pipeline always has instance_id in img_metas.
+            instance_inds = np.arange(len(gt_labels_3d), dtype=np.int64)
+        else:
+            instance_inds = np.asarray(instance_inds, dtype=np.int64)
 
         return {
             "gt_bboxes_3d": gt_bboxes_3d,
             "gt_labels_3d": gt_labels_3d,
             "gt_names": gt_names,
+            "instance_inds": instance_inds,
         }
 
     def evaluate(
