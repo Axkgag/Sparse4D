@@ -1,6 +1,6 @@
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import mmcv
 import numpy as np
@@ -272,9 +272,155 @@ class AiMotiveTLTSDataset(Dataset):
         out_dir=None,
         pipeline=None,
     ):
-        # The official TL/TS benchmark protocol is dataset-specific; keep default
-        # behavior lightweight so test-time inference can run without crashing.
-        return {}
+        if metric is None:
+            metric = "center_distance"
+        if metric not in ["center_distance", "bbox"]:
+            raise ValueError(f"Unsupported metric={metric}")
+
+        if not isinstance(results, list):
+            raise TypeError("results must be a list")
+        if len(results) != len(self):
+            raise ValueError(
+                f"The length of results is {len(results)} but dataset length is {len(self)}"
+            )
+
+        metric_prefix = f"{result_names[0]}_AiMotive"
+        match_dist_thr = 2.0
+        cls_records = {i: [] for i in range(len(self.CLASSES))}
+        num_gts = {i: 0 for i in range(len(self.CLASSES))}
+
+        for idx, result in enumerate(results):
+            pred = result.get("img_bbox", result)
+            pred_boxes, pred_scores, pred_labels = self._extract_predictions(pred)
+
+            ann = self.get_ann_info(idx)
+            gt_boxes = np.asarray(ann["gt_bboxes_3d"], dtype=np.float32)
+            gt_labels = np.asarray(ann["gt_labels_3d"], dtype=np.int64)
+
+            for cls_id in range(len(self.CLASSES)):
+                gt_mask = gt_labels == cls_id
+                gt_cls_boxes = gt_boxes[gt_mask]
+                num_gts[cls_id] += len(gt_cls_boxes)
+
+                pred_mask = pred_labels == cls_id
+                pred_cls_boxes = pred_boxes[pred_mask]
+                pred_cls_scores = pred_scores[pred_mask]
+
+                if len(pred_cls_scores) == 0:
+                    continue
+
+                order = np.argsort(-pred_cls_scores)
+                pred_cls_boxes = pred_cls_boxes[order]
+                pred_cls_scores = pred_cls_scores[order]
+
+                matched = np.zeros(len(gt_cls_boxes), dtype=bool)
+                gt_centers = gt_cls_boxes[:, :2] if len(gt_cls_boxes) > 0 else None
+                for box, score in zip(pred_cls_boxes, pred_cls_scores):
+                    is_tp = 0.0
+                    if gt_centers is not None and len(gt_centers) > 0:
+                        dists = np.linalg.norm(gt_centers - box[None, :2], axis=1)
+                        if len(dists) > 0:
+                            match_idx = int(np.argmin(dists))
+                            if (
+                                dists[match_idx] <= match_dist_thr
+                                and not matched[match_idx]
+                            ):
+                                matched[match_idx] = True
+                                is_tp = 1.0
+                    cls_records[cls_id].append((float(score), is_tp))
+
+        eval_dict = {}
+        aps, precisions, recalls = [], [], []
+        for cls_id, cls_name in enumerate(self.CLASSES):
+            records = cls_records[cls_id]
+            gt_count = num_gts[cls_id]
+            ap, precision, recall = self._compute_ap_pr(records, gt_count)
+            eval_dict[f"{metric_prefix}/{cls_name}_AP"] = ap
+            eval_dict[f"{metric_prefix}/{cls_name}_precision"] = precision
+            eval_dict[f"{metric_prefix}/{cls_name}_recall"] = recall
+            if gt_count > 0:
+                aps.append(ap)
+                precisions.append(precision)
+                recalls.append(recall)
+
+        eval_dict[f"{metric_prefix}/mAP"] = (
+            float(np.mean(aps)) if len(aps) > 0 else 0.0
+        )
+        eval_dict[f"{metric_prefix}/mPrecision"] = (
+            float(np.mean(precisions)) if len(precisions) > 0 else 0.0
+        )
+        eval_dict[f"{metric_prefix}/mRecall"] = (
+            float(np.mean(recalls)) if len(recalls) > 0 else 0.0
+        )
+        eval_dict[f"{metric_prefix}/match_dist_thr"] = float(match_dist_thr)
+        return eval_dict
+
+    @staticmethod
+    def _extract_predictions(pred: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        boxes = pred.get("boxes_3d", None) if isinstance(pred, dict) else None
+        scores = pred.get("scores_3d", None) if isinstance(pred, dict) else None
+        labels = pred.get("labels_3d", None) if isinstance(pred, dict) else None
+
+        if boxes is None or scores is None or labels is None:
+            return (
+                np.zeros((0, 9), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0,), dtype=np.int64),
+            )
+
+        if hasattr(boxes, "tensor"):
+            boxes_np = boxes.tensor.detach().cpu().numpy()
+        elif hasattr(boxes, "detach"):
+            boxes_np = boxes.detach().cpu().numpy()
+        else:
+            boxes_np = np.asarray(boxes)
+
+        if hasattr(scores, "detach"):
+            scores_np = scores.detach().cpu().numpy()
+        else:
+            scores_np = np.asarray(scores)
+
+        if hasattr(labels, "detach"):
+            labels_np = labels.detach().cpu().numpy()
+        else:
+            labels_np = np.asarray(labels)
+
+        if boxes_np.size == 0:
+            boxes_np = np.zeros((0, 9), dtype=np.float32)
+        elif boxes_np.ndim == 1:
+            boxes_np = boxes_np[None, :]
+
+        return (
+            boxes_np.astype(np.float32),
+            scores_np.astype(np.float32),
+            labels_np.astype(np.int64),
+        )
+
+    @staticmethod
+    def _compute_ap_pr(
+        records: List[Tuple[float, float]], gt_count: int
+    ) -> Tuple[float, float, float]:
+        if gt_count <= 0:
+            return 0.0, 0.0, 0.0
+        if len(records) == 0:
+            return 0.0, 0.0, 0.0
+
+        records = sorted(records, key=lambda x: x[0], reverse=True)
+        tp = np.asarray([x[1] for x in records], dtype=np.float32)
+        fp = 1.0 - tp
+
+        tp_cum = np.cumsum(tp)
+        fp_cum = np.cumsum(fp)
+        recalls = tp_cum / max(float(gt_count), 1.0)
+        precisions = tp_cum / np.maximum(tp_cum + fp_cum, 1e-12)
+
+        # Precision envelope + integration for robust AP.
+        mrec = np.concatenate(([0.0], recalls, [1.0]))
+        mpre = np.concatenate(([0.0], precisions, [0.0]))
+        for i in range(len(mpre) - 1, 0, -1):
+            mpre[i - 1] = max(mpre[i - 1], mpre[i])
+        ap = float(np.sum((mrec[1:] - mrec[:-1]) * mpre[1:]))
+        return ap, float(precisions[-1]), float(recalls[-1])
 
     def _build_infos(self) -> List[Dict]:
         sequence_dirs = self._find_sequence_dirs(self.data_root)

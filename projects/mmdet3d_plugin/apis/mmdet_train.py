@@ -15,6 +15,7 @@ from mmcv.runner import (
     DistSamplerSeedHook,
     EpochBasedRunner,
     Fp16OptimizerHook,
+    Hook,
     OptimizerHook,
     build_optimizer,
     build_runner,
@@ -33,6 +34,14 @@ from projects.mmdet3d_plugin.core.evaluation.eval_hooks import (
     CustomDistEvalHook,
 )
 from projects.mmdet3d_plugin.datasets import custom_build_dataset
+
+
+class _EnsureDataTimeHook(Hook):
+    """Minimal safeguard for mmcv TextLoggerHook expecting data_time."""
+
+    def after_train_iter(self, runner):
+        if "time" in runner.log_buffer.output and "data_time" not in runner.log_buffer.output:
+            runner.log_buffer.output["data_time"] = 0.0
 
 
 def custom_train_detector(
@@ -156,6 +165,7 @@ def custom_train_detector(
         cfg.log_config,
         cfg.get("momentum_config", None),
     )
+    runner.register_hook(_EnsureDataTimeHook(), priority="ABOVE_NORMAL")
 
     # register profiler hook
     # trace_config = dict(type='tb_trace', dir_name='work_dir')
