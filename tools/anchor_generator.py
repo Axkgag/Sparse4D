@@ -13,7 +13,8 @@ def get_kmeans_anchor(
     verbose=False,
 ):
     data = mmcv.load(ann_file, file_format="pkl")
-    gt_boxes = np.concatenate([x["gt_boxes"] for x in data["infos"]], axis=0)
+    # gt_boxes
+    gt_boxes = np.concatenate([x["gt_bboxes_3d"] for x in data["infos"]], axis=0)
     distance = np.linalg.norm(gt_boxes[:, :3], axis=-1, ord=2)
     mask = distance <= detection_range
     gt_boxes = gt_boxes[mask]

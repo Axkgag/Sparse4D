@@ -11,3 +11,4 @@ logs/
 .vscode/
 /projects/mmdet3d_plugin/ops
 /projects/mmdet3d_plugin/datasets/aimotive-dataset-loader
+/val

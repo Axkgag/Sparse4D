@@ -14,6 +14,6 @@ then
         ${gpu_num} \
         --work-dir=work_dirs/$1
 else
-    python ./tools/train.py \
+    /root/miniconda3/envs/sparse4d/bin/python ./tools/train.py \
         ${config}
 fi
