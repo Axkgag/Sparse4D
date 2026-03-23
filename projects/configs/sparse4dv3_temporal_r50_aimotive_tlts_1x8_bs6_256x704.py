@@ -35,7 +35,7 @@ log_config = dict(
 load_from = None
 resume_from = None
 workflow = [("train", 1)]
-fp16 = dict(loss_scale=32.0)
+fp16 = dict(loss_scale="dynamic")
 input_shape = (704, 256)
 
 # ================== AiMotive dataset settings ========================

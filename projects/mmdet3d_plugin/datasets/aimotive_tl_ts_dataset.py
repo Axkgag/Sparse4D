@@ -651,7 +651,7 @@ class AiMotiveTLTSDataset(Dataset):
             yaw = math.atan2(rot[1, 0], rot[0, 0])
             vx = float(obj.get("Velocity X", 0.0))
             vy = float(obj.get("Velocity Y", 0.0))
-            return [x, y, z, w, l, h, yaw, vx, vy]
+            return [x, y, z, l, w, h, yaw, vx, vy]
         except Exception:
             return None
 
