@@ -49,6 +49,8 @@ class AiMotiveTLTSDataset(Dataset):
         with_seq_flag: bool = False,
         sequences_split_num: int = 1,
         keep_consistent_seq_aug: bool = True,
+        filter_empty_gt: bool = True,
+        gt_filter_radius: Optional[float] = 120.0,
         lazy_init: bool = False,
     ):
         super().__init__()
@@ -65,6 +67,8 @@ class AiMotiveTLTSDataset(Dataset):
         self.with_seq_flag = with_seq_flag
         self.sequences_split_num = sequences_split_num
         self.keep_consistent_seq_aug = keep_consistent_seq_aug
+        self.filter_empty_gt = filter_empty_gt
+        self.gt_filter_radius = gt_filter_radius
         self.current_aug = None
         self.last_id = None
 
@@ -81,6 +85,9 @@ class AiMotiveTLTSDataset(Dataset):
             self.data_infos = self.load_annotations(self.ann_file)
         else:
             self.data_infos = self._build_infos()
+
+        if not self.test_mode and self.filter_empty_gt:
+            self.data_infos = self._filter_training_infos(self.data_infos)
 
         if self.with_seq_flag:
             self._set_sequence_group_flag()
@@ -142,6 +149,58 @@ class AiMotiveTLTSDataset(Dataset):
         if os.path.isabs(path):
             return path
         return os.path.join(self.data_root, path)
+
+    def _filter_training_infos(self, infos: List[Dict]) -> List[Dict]:
+        """Filter out training samples without usable GT boxes.
+
+        This keeps DDP behavior stable by reducing the chance that some ranks
+        receive batches with no valid GT after basic dataset-side checks.
+        """
+        filtered_infos: List[Dict] = []
+        for info in infos:
+            gt_boxes = np.asarray(
+                info.get("gt_bboxes_3d", np.zeros((0, 9), dtype=np.float32)),
+                dtype=np.float32,
+            )
+            gt_labels = np.asarray(
+                info.get("gt_labels_3d", np.zeros((0,), dtype=np.int64)),
+                dtype=np.int64,
+            )
+
+            if gt_boxes.ndim != 2 or gt_boxes.shape[0] == 0:
+                continue
+
+            keep = np.ones((gt_boxes.shape[0],), dtype=bool)
+            keep &= np.isfinite(gt_boxes).all(axis=1)
+            keep &= np.isfinite(gt_labels)
+            keep &= (gt_labels >= 0) & (gt_labels < len(self.CLASSES))
+
+            # Basic physical sanity for box size.
+            if gt_boxes.shape[1] >= 6:
+                keep &= (gt_boxes[:, 3:6] > 0).all(axis=1)
+
+            # Align with range filtering in training pipeline when configured.
+            if self.gt_filter_radius is not None:
+                centers_xy = gt_boxes[:, :2]
+                keep &= np.linalg.norm(centers_xy, axis=1) <= float(
+                    self.gt_filter_radius
+                )
+
+            if not np.any(keep):
+                continue
+
+            info = dict(info)
+            info["gt_bboxes_3d"] = gt_boxes[keep]
+            info["gt_labels_3d"] = gt_labels[keep]
+            if "gt_names" in info and info["gt_names"] is not None:
+                info["gt_names"] = np.asarray(info["gt_names"], dtype=object)[keep]
+            if "instance_inds" in info and info["instance_inds"] is not None:
+                info["instance_inds"] = np.asarray(
+                    info["instance_inds"], dtype=np.int64
+                )[keep]
+            filtered_infos.append(info)
+
+        return filtered_infos
 
     def _set_sequence_group_flag(self):
         flags = []
