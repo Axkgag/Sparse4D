@@ -179,6 +179,7 @@ class AiMotiveTLTSDataset(Dataset):
 
             norm_infos.append(info)
 
+        norm_infos = self._remap_timestamps(norm_infos)
         norm_infos = norm_infos[:: self.load_interval]
         return norm_infos
 
@@ -186,6 +187,56 @@ class AiMotiveTLTSDataset(Dataset):
         if os.path.isabs(path):
             return path
         return os.path.join(self.data_root, path)
+
+    def _parse_sequence_and_frame(self, info: Dict) -> Tuple[str, int]:
+        sequence_id = str(info.get("sequence_id", ""))
+        sample_idx = str(info.get("sample_idx", ""))
+        frame_idx = None
+        if sample_idx:
+            try:
+                frame_idx = int(sample_idx.rsplit("_", 1)[-1])
+                if not sequence_id:
+                    sequence_id = sample_idx.rsplit("_", 1)[0]
+            except Exception:
+                frame_idx = None
+
+        if frame_idx is None:
+            raw_ts = info.get("timestamp", 0.0)
+            try:
+                frame_idx = int(float(raw_ts))
+            except Exception:
+                frame_idx = 0
+
+        return sequence_id, int(frame_idx)
+
+    def _remap_timestamps(self, infos: List[Dict]) -> List[Dict]:
+        if len(infos) == 0:
+            return infos
+
+        seq_ids: List[str] = []
+        parsed_frames: List[int] = []
+        max_frame = 0
+        for info in infos:
+            seq_id, frame_idx = self._parse_sequence_and_frame(info)
+            seq_ids.append(seq_id)
+            parsed_frames.append(frame_idx)
+            if frame_idx > max_frame:
+                max_frame = frame_idx
+
+        seq_order = sorted(set(seq_ids))
+        seq_to_idx = {s: i for i, s in enumerate(seq_order)}
+
+        # Keep timestamps compact for float32 precision while separating sequences.
+        offset = max(max_frame + 100, 10000)
+        max_ts = offset * max(len(seq_order), 1) + max_frame
+        if max_ts > 1.5e7 and offset > 0:
+            scale = max_ts / 1.5e7
+            offset = max(1000, int(offset / scale))
+
+        for info, seq_id, frame_idx in zip(infos, seq_ids, parsed_frames):
+            seq_idx = seq_to_idx.get(seq_id, 0)
+            info["timestamp"] = float(seq_idx * offset + frame_idx)
+        return infos
 
     def _filter_training_infos(self, infos: List[Dict]) -> List[Dict]:
         """Filter out training samples without usable GT boxes.
@@ -570,6 +621,7 @@ class AiMotiveTLTSDataset(Dataset):
         for seq_dir in sequence_dirs:
             infos.extend(self._build_sequence_infos(seq_dir))
 
+        infos = self._remap_timestamps(infos)
         infos = infos[:: self.load_interval]
         return infos
 

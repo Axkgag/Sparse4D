@@ -142,6 +142,7 @@ def _build_infos_for_sequences(dataset, seq_dirs):
 
             stats["num_infos_after"] += 1
             infos.append(info)
+    infos = dataset._remap_timestamps(infos)
     return infos, stats
 
 
