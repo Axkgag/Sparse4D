@@ -1,6 +1,7 @@
 import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
+import warnings
 
 import mmcv
 import numpy as np
@@ -51,6 +52,9 @@ class AiMotiveTLTSDataset(Dataset):
         keep_consistent_seq_aug: bool = True,
         filter_empty_gt: bool = True,
         gt_filter_radius: Optional[float] = 120.0,
+        min_box_size: float = 1e-2,
+        max_box_size: float = 100.0,
+        max_abs_velocity: float = 30.0,
         lazy_init: bool = False,
     ):
         super().__init__()
@@ -69,6 +73,9 @@ class AiMotiveTLTSDataset(Dataset):
         self.keep_consistent_seq_aug = keep_consistent_seq_aug
         self.filter_empty_gt = filter_empty_gt
         self.gt_filter_radius = gt_filter_radius
+        self.min_box_size = float(min_box_size)
+        self.max_box_size = float(max_box_size)
+        self.max_abs_velocity = float(max_abs_velocity)
         self.current_aug = None
         self.last_id = None
 
@@ -122,11 +129,29 @@ class AiMotiveTLTSDataset(Dataset):
 
             for key in ["lidar2img", "cam_intrinsic"]:
                 if key in info:
-                    info[key] = [np.asarray(x, dtype=np.float32) for x in info[key]]
+                    mats = [np.asarray(x, dtype=np.float32) for x in info[key]]
+                    valid_mats = []
+                    for mat in mats:
+                        if mat.shape == (4, 4):
+                            out = mat
+                        elif mat.shape == (3, 4):
+                            out = np.eye(4, dtype=np.float32)
+                            out[:3, :] = mat
+                        elif mat.shape == (3, 3):
+                            out = np.eye(4, dtype=np.float32)
+                            out[:3, :3] = mat
+                        else:
+                            out = np.eye(4, dtype=np.float32)
+                        if not np.isfinite(out).all():
+                            out = np.eye(4, dtype=np.float32)
+                        valid_mats.append(out)
+                    info[key] = valid_mats
 
             if "lidar2global" in info:
                 info["lidar2global"] = np.asarray(info["lidar2global"], dtype=np.float32)
             else:
+                info["lidar2global"] = np.eye(4, dtype=np.float32)
+            if info["lidar2global"].shape != (4, 4) or not np.isfinite(info["lidar2global"]).all():
                 info["lidar2global"] = np.eye(4, dtype=np.float32)
 
             if "gt_bboxes_3d" in info and info["gt_bboxes_3d"] is not None:
@@ -139,6 +164,18 @@ class AiMotiveTLTSDataset(Dataset):
                 info["instance_inds"] = np.asarray(
                     info["instance_inds"], dtype=np.int64
                 )
+
+            ann = self._sanitize_annotations(
+                info.get("gt_bboxes_3d"),
+                info.get("gt_labels_3d"),
+                info.get("gt_names"),
+                info.get("instance_inds"),
+                apply_radius_filter=(not self.test_mode),
+            )
+            info["gt_bboxes_3d"] = ann["gt_bboxes_3d"]
+            info["gt_labels_3d"] = ann["gt_labels_3d"]
+            info["gt_names"] = ann["gt_names"]
+            info["instance_inds"] = ann["instance_inds"]
 
             norm_infos.append(info)
 
@@ -158,46 +195,20 @@ class AiMotiveTLTSDataset(Dataset):
         """
         filtered_infos: List[Dict] = []
         for info in infos:
-            gt_boxes = np.asarray(
-                info.get("gt_bboxes_3d", np.zeros((0, 9), dtype=np.float32)),
-                dtype=np.float32,
+            ann = self._sanitize_annotations(
+                info.get("gt_bboxes_3d"),
+                info.get("gt_labels_3d"),
+                info.get("gt_names"),
+                info.get("instance_inds"),
+                apply_radius_filter=True,
             )
-            gt_labels = np.asarray(
-                info.get("gt_labels_3d", np.zeros((0,), dtype=np.int64)),
-                dtype=np.int64,
-            )
-
-            if gt_boxes.ndim != 2 or gt_boxes.shape[0] == 0:
+            if ann["gt_bboxes_3d"].shape[0] == 0:
                 continue
-
-            keep = np.ones((gt_boxes.shape[0],), dtype=bool)
-            keep &= np.isfinite(gt_boxes).all(axis=1)
-            keep &= np.isfinite(gt_labels)
-            keep &= (gt_labels >= 0) & (gt_labels < len(self.CLASSES))
-
-            # Basic physical sanity for box size.
-            if gt_boxes.shape[1] >= 6:
-                keep &= (gt_boxes[:, 3:6] > 0).all(axis=1)
-
-            # Align with range filtering in training pipeline when configured.
-            if self.gt_filter_radius is not None:
-                centers_xy = gt_boxes[:, :2]
-                keep &= np.linalg.norm(centers_xy, axis=1) <= float(
-                    self.gt_filter_radius
-                )
-
-            if not np.any(keep):
-                continue
-
             info = dict(info)
-            info["gt_bboxes_3d"] = gt_boxes[keep]
-            info["gt_labels_3d"] = gt_labels[keep]
-            if "gt_names" in info and info["gt_names"] is not None:
-                info["gt_names"] = np.asarray(info["gt_names"], dtype=object)[keep]
-            if "instance_inds" in info and info["instance_inds"] is not None:
-                info["instance_inds"] = np.asarray(
-                    info["instance_inds"], dtype=np.int64
-                )[keep]
+            info["gt_bboxes_3d"] = ann["gt_bboxes_3d"]
+            info["gt_labels_3d"] = ann["gt_labels_3d"]
+            info["gt_names"] = ann["gt_names"]
+            info["instance_inds"] = ann["instance_inds"]
             filtered_infos.append(info)
 
         return filtered_infos
@@ -297,27 +308,98 @@ class AiMotiveTLTSDataset(Dataset):
 
     def get_ann_info(self, index: int) -> Dict:
         info = self.data_infos[index]
-        gt_bboxes_3d = info.get("gt_bboxes_3d")
-        gt_labels_3d = info.get("gt_labels_3d")
-        gt_names = info.get("gt_names")
-        instance_inds = info.get("instance_inds")
+        return self._sanitize_annotations(
+            info.get("gt_bboxes_3d"),
+            info.get("gt_labels_3d"),
+            info.get("gt_names"),
+            info.get("instance_inds"),
+            apply_radius_filter=(not self.test_mode),
+        )
 
-        if gt_bboxes_3d is None:
-            gt_bboxes_3d = np.zeros((0, 9), dtype=np.float32)
-            gt_labels_3d = np.zeros((0,), dtype=np.int64)
-            gt_names = np.array([], dtype=object)
-            instance_inds = np.zeros((0,), dtype=np.int64)
-        elif instance_inds is None:
-            # Ensure downstream pipeline always has instance_id in img_metas.
-            instance_inds = np.arange(len(gt_labels_3d), dtype=np.int64)
+    def _sanitize_annotations(
+        self,
+        gt_bboxes_3d,
+        gt_labels_3d,
+        gt_names,
+        instance_inds,
+        apply_radius_filter: bool,
+    ) -> Dict[str, np.ndarray]:
+        boxes = np.asarray(
+            gt_bboxes_3d if gt_bboxes_3d is not None else np.zeros((0, 9)),
+            dtype=np.float32,
+        )
+        labels = np.asarray(
+            gt_labels_3d if gt_labels_3d is not None else np.zeros((0,)),
+            dtype=np.int64,
+        )
+
+        if boxes.ndim == 1:
+            boxes = boxes[None, :]
+        if boxes.ndim != 2 or boxes.shape[0] == 0:
+            return {
+                "gt_bboxes_3d": np.zeros((0, 9), dtype=np.float32),
+                "gt_labels_3d": np.zeros((0,), dtype=np.int64),
+                "gt_names": np.array([], dtype=object),
+                "instance_inds": np.zeros((0,), dtype=np.int64),
+            }
+
+        if boxes.shape[1] < 9:
+            pad = np.zeros((boxes.shape[0], 9 - boxes.shape[1]), dtype=np.float32)
+            boxes = np.concatenate([boxes, pad], axis=1)
+        elif boxes.shape[1] > 9:
+            boxes = boxes[:, :9]
+
+        if labels.shape[0] != boxes.shape[0]:
+            min_n = min(labels.shape[0], boxes.shape[0])
+            boxes = boxes[:min_n]
+            labels = labels[:min_n]
+
+        keep = np.ones((boxes.shape[0],), dtype=bool)
+        keep &= np.isfinite(boxes).all(axis=1)
+        keep &= np.isfinite(labels)
+        keep &= (labels >= 0) & (labels < len(self.CLASSES))
+
+        sizes = boxes[:, 3:6]
+        keep &= (sizes >= self.min_box_size).all(axis=1)
+        keep &= (sizes <= self.max_box_size).all(axis=1)
+
+        if boxes.shape[1] >= 9:
+            boxes[:, 7:9] = np.clip(
+                np.nan_to_num(boxes[:, 7:9], nan=0.0, posinf=0.0, neginf=0.0),
+                -self.max_abs_velocity,
+                self.max_abs_velocity,
+            )
+
+        boxes[:, 6] = np.mod(boxes[:, 6] + np.pi, 2 * np.pi) - np.pi
+
+        if apply_radius_filter and self.gt_filter_radius is not None:
+            keep &= np.linalg.norm(boxes[:, :2], axis=1) <= float(self.gt_filter_radius)
+
+        boxes = boxes[keep]
+        labels = labels[keep]
+
+        if gt_names is None:
+            names = np.asarray([self.CLASSES[i] for i in labels], dtype=object)
         else:
-            instance_inds = np.asarray(instance_inds, dtype=np.int64)
+            names = np.asarray(gt_names, dtype=object)
+            if names.shape[0] >= keep.shape[0]:
+                names = names[: keep.shape[0]][keep]
+            else:
+                names = np.asarray([self.CLASSES[i] for i in labels], dtype=object)
+
+        if instance_inds is None:
+            ids = np.arange(len(labels), dtype=np.int64)
+        else:
+            ids = np.asarray(instance_inds, dtype=np.int64)
+            if ids.shape[0] != keep.shape[0]:
+                ids = np.arange(keep.shape[0], dtype=np.int64)
+            ids = ids[keep]
 
         return {
-            "gt_bboxes_3d": gt_bboxes_3d,
-            "gt_labels_3d": gt_labels_3d,
-            "gt_names": gt_names,
-            "instance_inds": instance_inds,
+            "gt_bboxes_3d": np.ascontiguousarray(boxes, dtype=np.float32),
+            "gt_labels_3d": np.ascontiguousarray(labels, dtype=np.int64),
+            "gt_names": np.asarray(names, dtype=object),
+            "instance_inds": np.ascontiguousarray(ids, dtype=np.int64),
         }
 
     def evaluate(
@@ -710,7 +792,12 @@ class AiMotiveTLTSDataset(Dataset):
             yaw = math.atan2(rot[1, 0], rot[0, 0])
             vx = float(obj.get("Velocity X", 0.0))
             vy = float(obj.get("Velocity Y", 0.0))
-            return [x, y, z, l, w, h, yaw, vx, vy]
+            if not np.isfinite(vx):
+                vx = 0.0
+            if not np.isfinite(vy):
+                vy = 0.0
+            # Sparse4D target encoder expects [x, y, z, w, l, h, yaw, vx, vy].
+            return [x, y, z, w, l, h, yaw, vx, vy]
         except Exception:
             return None
 
@@ -728,11 +815,17 @@ class AiMotiveTLTSDataset(Dataset):
         intrinsic_list = []
         for calib in cam_calibs:
             K = np.asarray(calib["K"], dtype=np.float32)
+            if not np.isfinite(K).all() or K.shape != (3, 3):
+                warnings.warn("Invalid camera intrinsic found, fallback to identity.")
+                K = np.eye(3, dtype=np.float32)
             if "T_ego_to_cam" in calib:
                 T_ego_to_cam = np.asarray(calib["T_ego_to_cam"], dtype=np.float32)
             else:
                 T_cam_to_ego = np.asarray(calib["T_cam_to_ego"], dtype=np.float32)
                 T_ego_to_cam = np.linalg.inv(T_cam_to_ego)
+            if not np.isfinite(T_ego_to_cam).all() or T_ego_to_cam.shape != (4, 4):
+                warnings.warn("Invalid camera extrinsic found, fallback to identity.")
+                T_ego_to_cam = np.eye(4, dtype=np.float32)
 
             viewpad = np.eye(4, dtype=np.float32)
             viewpad[:3, :3] = K
@@ -870,13 +963,15 @@ class AiMotiveTLTSDataset(Dataset):
             if mat.shape == (4, 4):
                 mat = mat.copy()
                 mat[:3, :3] = AiMotiveTLTSDataset._orthonormalize_rotation(mat[:3, :3])
-                return mat
+                if np.isfinite(mat).all():
+                    return mat
         if "matrix" in entry:
             mat = np.asarray(entry["matrix"], dtype=np.float32)
             if mat.shape == (4, 4):
                 mat = mat.copy()
                 mat[:3, :3] = AiMotiveTLTSDataset._orthonormalize_rotation(mat[:3, :3])
-                return mat
+                if np.isfinite(mat).all():
+                    return mat
 
         trans = None
         for key in ["translation", "position", "t"]:
@@ -896,6 +991,8 @@ class AiMotiveTLTSDataset(Dataset):
             q = pyquaternion.Quaternion(quat.tolist())
             pose[:3, :3] = q.rotation_matrix.astype(np.float32)
         pose[:3, 3] = trans
+        if not np.isfinite(pose).all():
+            return np.eye(4, dtype=np.float32)
         return pose
 
     @staticmethod

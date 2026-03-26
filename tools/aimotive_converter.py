@@ -104,9 +104,45 @@ def _find_scene_sequence_dirs(root_path, scene_names):
 
 def _build_infos_for_sequences(dataset, seq_dirs):
     infos = []
+    stats = {
+        "num_infos_before": 0,
+        "num_infos_after": 0,
+        "num_infos_dropped_empty": 0,
+        "num_boxes_before": 0,
+        "num_boxes_after": 0,
+    }
     for seq_dir in seq_dirs:
-        infos.extend(dataset._build_sequence_infos(seq_dir))
-    return infos
+        seq_infos = dataset._build_sequence_infos(seq_dir)
+        for info in seq_infos:
+            stats["num_infos_before"] += 1
+            boxes_before = np.asarray(
+                info.get("gt_bboxes_3d", np.zeros((0, 9), dtype=np.float32)),
+                dtype=np.float32,
+            )
+            stats["num_boxes_before"] += int(boxes_before.shape[0])
+
+            ann = dataset._sanitize_annotations(
+                info.get("gt_bboxes_3d"),
+                info.get("gt_labels_3d"),
+                info.get("gt_names"),
+                info.get("instance_inds"),
+                apply_radius_filter=True,
+            )
+            info = dict(info)
+            info["gt_bboxes_3d"] = ann["gt_bboxes_3d"]
+            info["gt_labels_3d"] = ann["gt_labels_3d"]
+            info["gt_names"] = ann["gt_names"]
+            info["instance_inds"] = ann["instance_inds"]
+
+            boxes_after = info["gt_bboxes_3d"]
+            stats["num_boxes_after"] += int(boxes_after.shape[0])
+            if boxes_after.shape[0] == 0:
+                stats["num_infos_dropped_empty"] += 1
+                continue
+
+            stats["num_infos_after"] += 1
+            infos.append(info)
+    return infos, stats
 
 
 def _dump_infos(info_prefix, split, infos, metadata):
@@ -192,8 +228,11 @@ def create_aimotive_infos_with_split(
         }
 
     split_infos = {}
+    split_stats = {}
     for split in ["train", "val", "test"]:
-        split_infos[split] = _build_infos_for_sequences(dataset, split_seq_map[split])
+        infos, stats = _build_infos_for_sequences(dataset, split_seq_map[split])
+        split_infos[split] = infos
+        split_stats[split] = stats
 
     common_metadata = {
         "dataset": "aimotive_tl_ts",
@@ -205,12 +244,21 @@ def create_aimotive_infos_with_split(
         "val_ratio": val_ratio,
         "test_ratio": test_ratio,
         "scene_stats": scene_stats,
+        "sanitize_thresholds": {
+            "gt_filter_radius": float(dataset.gt_filter_radius)
+            if dataset.gt_filter_radius is not None
+            else None,
+            "min_box_size": float(dataset.min_box_size),
+            "max_box_size": float(dataset.max_box_size),
+            "max_abs_velocity": float(dataset.max_abs_velocity),
+        },
     }
 
     for split in ["train", "val", "test"]:
         metadata = dict(common_metadata)
         metadata["split"] = split
         metadata["num_infos"] = len(split_infos[split])
+        metadata["sanitize_stats"] = split_stats[split]
         _dump_infos(info_prefix, split, split_infos[split], metadata)
 
     print("Scene-level sequence split stats:")
@@ -219,6 +267,16 @@ def create_aimotive_infos_with_split(
         print(
             f"  {scene}: total={s['num_sequences']} "
             f"train={s['train']} val={s['val']} test={s['test']}"
+        )
+    print("Sanitization stats:")
+    for split in ["train", "val", "test"]:
+        s = split_stats[split]
+        print(
+            f"  {split}: infos_before={s['num_infos_before']} "
+            f"infos_after={s['num_infos_after']} "
+            f"dropped_empty={s['num_infos_dropped_empty']} "
+            f"boxes_before={s['num_boxes_before']} "
+            f"boxes_after={s['num_boxes_after']}"
         )
 
 
