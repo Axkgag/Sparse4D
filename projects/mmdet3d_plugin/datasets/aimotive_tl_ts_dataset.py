@@ -2,6 +2,7 @@ import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 import warnings
+import zlib
 
 import mmcv
 import numpy as np
@@ -53,8 +54,8 @@ class AiMotiveTLTSDataset(Dataset):
         filter_empty_gt: bool = True,
         gt_filter_radius: Optional[float] = 120.0,
         min_box_size: float = 1e-2,
-        max_box_size: float = 100.0,
-        max_abs_velocity: float = 30.0,
+        max_box_size: float = 20.0,
+        max_abs_velocity: float = 5.0,
         lazy_init: bool = False,
     ):
         super().__init__()
@@ -209,6 +210,14 @@ class AiMotiveTLTSDataset(Dataset):
 
         return sequence_id, int(frame_idx)
 
+    @staticmethod
+    def _fallback_instance_ids(sample_uid: str, num_boxes: int) -> np.ndarray:
+        if num_boxes <= 0:
+            return np.zeros((0,), dtype=np.int64)
+        base = int(zlib.crc32(sample_uid.encode("utf-8")) & 0x7FFFFFFF)
+        # Reserve lower bits for per-frame local indices to avoid collisions.
+        return (np.arange(num_boxes, dtype=np.int64) + (base << 16)).astype(np.int64)
+
     def _remap_timestamps(self, infos: List[Dict]) -> List[Dict]:
         if len(infos) == 0:
             return infos
@@ -226,12 +235,9 @@ class AiMotiveTLTSDataset(Dataset):
         seq_order = sorted(set(seq_ids))
         seq_to_idx = {s: i for i, s in enumerate(seq_order)}
 
-        # Keep timestamps compact for float32 precision while separating sequences.
-        offset = max(max_frame + 100, 10000)
-        max_ts = offset * max(len(seq_order), 1) + max_frame
-        if max_ts > 1.5e7 and offset > 0:
-            scale = max_ts / 1.5e7
-            offset = max(1000, int(offset / scale))
+        # Keep sequence timestamps strictly non-overlapping to prevent
+        # cross-sequence temporal matching in InstanceBank.
+        offset = max(max_frame + 1000, 10000)
 
         for info, seq_id, frame_idx in zip(infos, seq_ids, parsed_frames):
             seq_idx = seq_to_idx.get(seq_id, 0)
@@ -359,13 +365,21 @@ class AiMotiveTLTSDataset(Dataset):
 
     def get_ann_info(self, index: int) -> Dict:
         info = self.data_infos[index]
-        return self._sanitize_annotations(
+        ann = self._sanitize_annotations(
             info.get("gt_bboxes_3d"),
             info.get("gt_labels_3d"),
             info.get("gt_names"),
             info.get("instance_inds"),
             apply_radius_filter=(not self.test_mode),
         )
+        # If source annotations do not provide stable track ids, avoid temporal
+        # id collisions by generating frame-unique fallback ids.
+        if info.get("instance_inds", None) is None:
+            sample_uid = str(info.get("sample_idx", f"idx_{index}"))
+            ann["instance_inds"] = self._fallback_instance_ids(
+                sample_uid, int(ann["gt_labels_3d"].shape[0])
+            )
+        return ann
 
     def _sanitize_annotations(
         self,
@@ -416,7 +430,9 @@ class AiMotiveTLTSDataset(Dataset):
 
         if boxes.shape[1] >= 9:
             boxes[:, 7:9] = np.clip(
-                np.nan_to_num(boxes[:, 7:9], nan=0.0, posinf=0.0, neginf=0.0),
+                np.nan_to_num(
+                    boxes[:, 7:9], nan=0.0, posinf=0.0, neginf=0.0
+                ),
                 -self.max_abs_velocity,
                 self.max_abs_velocity,
             )
@@ -826,8 +842,7 @@ class AiMotiveTLTSDataset(Dataset):
             return "priority"
         return subtype
 
-    @staticmethod
-    def _obj_to_box(obj: Dict) -> Optional[List[float]]:
+    def _obj_to_box(self, obj: Dict) -> Optional[List[float]]:
         try:
             x = float(obj["BoundingBox3D Origin X"])
             y = float(obj["BoundingBox3D Origin Y"])
@@ -844,10 +859,8 @@ class AiMotiveTLTSDataset(Dataset):
             yaw = math.atan2(rot[1, 0], rot[0, 0])
             vx = float(obj.get("Velocity X", 0.0))
             vy = float(obj.get("Velocity Y", 0.0))
-            if not np.isfinite(vx):
-                vx = 0.0
-            if not np.isfinite(vy):
-                vy = 0.0
+            if (not np.isfinite(vx)) or (not np.isfinite(vy)):
+                vx, vy = 0.0, 0.0
             # Sparse4D target encoder expects [x, y, z, w, l, h, yaw, vx, vy].
             return [x, y, z, w, l, h, yaw, vx, vy]
         except Exception:

@@ -128,6 +128,11 @@ def _build_infos_for_sequences(dataset, seq_dirs):
                 info.get("instance_inds"),
                 apply_radius_filter=True,
             )
+            if info.get("instance_inds", None) is None:
+                sample_uid = str(info.get("sample_idx", ""))
+                ann["instance_inds"] = dataset._fallback_instance_ids(
+                    sample_uid, int(ann["gt_labels_3d"].shape[0])
+                )
             info = dict(info)
             info["gt_bboxes_3d"] = ann["gt_bboxes_3d"]
             info["gt_labels_3d"] = ann["gt_labels_3d"]
