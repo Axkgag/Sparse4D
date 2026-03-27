@@ -11,7 +11,6 @@ Examples:
 
 import argparse
 import glob
-import json
 import os
 from collections import Counter, defaultdict
 from typing import Dict, List, Tuple
@@ -94,6 +93,10 @@ def diagnose_one(
     sample_reasons: Dict[str, List[str]] = defaultdict(list)
     seq_ts_map: Dict[str, List[float]] = defaultdict(list)
     global_instid_map: Dict[int, int] = Counter()
+    class_counter = Counter()
+
+    matrix_issues = Counter()
+    io_issues = Counter()
 
     box_sizes = []
     box_vels = []
@@ -129,6 +132,37 @@ def diagnose_one(
 
         n = gt_boxes.shape[0]
         counters["num_boxes"] += int(n)
+
+        for label in gt_labels.tolist():
+            class_counter[int(label)] += 1
+
+        for mat in info.get("lidar2img", []):
+            arr = np.asarray(mat)
+            if arr.shape != (4, 4):
+                matrix_issues["lidar2img_shape"] += 1
+            if not np.isfinite(arr).all():
+                matrix_issues["lidar2img_nonfinite"] += 1
+
+        for mat in info.get("cam_intrinsic", []):
+            arr = np.asarray(mat)
+            if arr.shape != (4, 4):
+                matrix_issues["cam_intrinsic_shape"] += 1
+            if not np.isfinite(arr).all():
+                matrix_issues["cam_intrinsic_nonfinite"] += 1
+
+        lidar2global = np.asarray(info.get("lidar2global", np.eye(4, dtype=np.float32)))
+        if lidar2global.shape != (4, 4):
+            matrix_issues["lidar2global_shape"] += 1
+        if not np.isfinite(lidar2global).all():
+            matrix_issues["lidar2global_nonfinite"] += 1
+
+        missing_img = False
+        for img_path in info.get("img_filename", []):
+            if not os.path.exists(str(img_path)):
+                missing_img = True
+                break
+        if missing_img:
+            io_issues["missing_img_path"] += 1
 
         if n == 0:
             counters["num_empty_infos"] += 1
@@ -224,6 +258,25 @@ def diagnose_one(
     # but for AiMotive TL/TS without stable IDs it is a useful warning.
     reused_inst_ids = sum(1 for _, c in global_instid_map.items() if c > 20)
 
+    all_dt = []
+    for _, ts_list in seq_ts_map.items():
+        arr = np.asarray(ts_list, dtype=np.float64)
+        if arr.size > 1 and np.isfinite(arr).all():
+            arr = np.sort(arr)
+            all_dt.append(np.diff(arr))
+    if all_dt:
+        all_dt = np.concatenate(all_dt)
+        dt_stats = {
+            "min": float(np.min(all_dt)),
+            "p50": float(np.percentile(all_dt, 50)),
+            "p99": float(np.percentile(all_dt, 99)),
+            "max": float(np.max(all_dt)),
+            "num_eq_0": int(np.sum(all_dt == 0)),
+            "num_lt_0": int(np.sum(all_dt < 0)),
+        }
+    else:
+        dt_stats = None
+
     suspicious = []
     for sample_idx, reasons in sample_reasons.items():
         uniq = sorted(set(reasons))
@@ -254,8 +307,12 @@ def diagnose_one(
         "pkl": pkl_path,
         "counters": dict(counters),
         "reason_counter": dict(reason_counter),
+        "class_counter": dict(class_counter),
         "size_stats": size_stats,
         "velocity_stats": vel_stats,
+        "matrix_issues": dict(matrix_issues),
+        "io_issues": dict(io_issues),
+        "dt_stats": dt_stats,
         "seq_timestamp_issues": seq_ts_issues,
         "num_reused_inst_ids_gt20_frames": reused_inst_ids,
         "top_suspicious_samples": [
@@ -292,6 +349,29 @@ def format_report(report: Dict) -> str:
         lines.append(
             f"seq timestamp issues: {len(report['seq_timestamp_issues'])} sequences"
         )
+
+    if report.get("dt_stats") is not None:
+        dt = report["dt_stats"]
+        lines.append(
+            "dt min/p50/p99/max="
+            f"{dt['min']}/{dt['p50']}/{dt['p99']}/{dt['max']} "
+            f"eq0={dt['num_eq_0']} lt0={dt['num_lt_0']}"
+        )
+
+    if report.get("matrix_issues"):
+        lines.append("matrix issues:")
+        for k, v in sorted(report["matrix_issues"].items(), key=lambda x: -x[1]):
+            lines.append(f"  - {k}: {v}")
+
+    if report.get("io_issues"):
+        lines.append("io issues:")
+        for k, v in sorted(report["io_issues"].items(), key=lambda x: -x[1]):
+            lines.append(f"  - {k}: {v}")
+
+    if report.get("class_counter"):
+        cls_pairs = sorted(report["class_counter"].items(), key=lambda x: -x[1])
+        preview = cls_pairs[:10]
+        lines.append(f"class counter (top): {preview}")
 
     lines.append(
         f"reused inst ids (>20 frames): {report['num_reused_inst_ids_gt20_frames']}"
