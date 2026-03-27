@@ -24,6 +24,52 @@ except:
 __all__ = ["Sparse4D"]
 
 
+def _iter_tensors(obj):
+    if torch.is_tensor(obj):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_tensors(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _iter_tensors(v)
+
+
+def _extract_sample_indices(data, max_items=8):
+    img_metas = data.get("img_metas", [])
+    if hasattr(img_metas, "data"):
+        img_metas = img_metas.data
+    if isinstance(img_metas, tuple):
+        img_metas = list(img_metas)
+    if isinstance(img_metas, list) and len(img_metas) == 1 and isinstance(img_metas[0], list):
+        img_metas = img_metas[0]
+
+    sample_indices = []
+    if isinstance(img_metas, list):
+        for meta in img_metas:
+            if isinstance(meta, dict):
+                sid = meta.get("sample_idx", None)
+                if sid is not None:
+                    sample_indices.append(str(sid))
+    return sample_indices[:max_items]
+
+
+def _check_finite(name, obj, data):
+    for tensor in _iter_tensors(obj):
+        if tensor.numel() == 0:
+            continue
+        if not torch.isfinite(tensor).all():
+            det = tensor.detach()
+            bad_count = int((~torch.isfinite(det)).sum().item())
+            total = int(det.numel())
+            sample_indices = _extract_sample_indices(data)
+            msg = (
+                f"Non-finite detected in {name}: bad={bad_count}/{total}, "
+                f"shape={tuple(det.shape)}, dtype={det.dtype}, sample_idx={sample_indices}"
+            )
+            raise FloatingPointError(msg)
+
+
 @DETECTORS.register_module()
 class Sparse4D(BaseDetector):
     def __init__(
@@ -98,12 +144,22 @@ class Sparse4D(BaseDetector):
 
     def forward_train(self, img, **data):
         feature_maps, depths = self.extract_feat(img, True, data)
+        _check_finite("feature_maps", feature_maps, data)
+        if depths is not None:
+            _check_finite("depths", depths, data)
+
         model_outs = self.head(feature_maps, data)
+        _check_finite("model_outs", model_outs, data)
+
         output = self.head.loss(model_outs, data)
+        for key, value in output.items():
+            _check_finite(f"loss:{key}", value, data)
+
         if depths is not None and "gt_depth" in data:
             output["loss_dense_depth"] = self.depth_branch.loss(
                 depths, data["gt_depth"]
             )
+            _check_finite("loss:loss_dense_depth", output["loss_dense_depth"], data)
         return output
 
     def forward_test(self, img, **data):

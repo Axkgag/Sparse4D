@@ -5,6 +5,8 @@
 # ---------------------------------------------
 import random
 import warnings
+import math
+import os
 
 import numpy as np
 import torch
@@ -42,6 +44,95 @@ class _EnsureDataTimeHook(Hook):
     def after_train_iter(self, runner):
         if "time" in runner.log_buffer.output and "data_time" not in runner.log_buffer.output:
             runner.log_buffer.output["data_time"] = 0.0
+
+
+def _unwrap_data_container(obj):
+    if hasattr(obj, "data"):
+        return obj.data
+    return obj
+
+
+def _extract_sample_indices_from_batch(data_batch, max_items=8):
+    if not isinstance(data_batch, dict):
+        return []
+    img_metas = _unwrap_data_container(data_batch.get("img_metas", []))
+    if isinstance(img_metas, tuple):
+        img_metas = list(img_metas)
+    if isinstance(img_metas, list) and len(img_metas) == 1 and isinstance(img_metas[0], list):
+        img_metas = img_metas[0]
+
+    sample_indices = []
+    if isinstance(img_metas, list):
+        for meta in img_metas:
+            if isinstance(meta, dict) and "sample_idx" in meta:
+                sample_indices.append(str(meta["sample_idx"]))
+    return sample_indices[:max_items]
+
+
+class _NumericDebugHook(Hook):
+    """Debug numeric stability and persist first clues for NaN/Inf issues."""
+
+    def __init__(self, work_dir, interval=50, filename="numeric_debug.log"):
+        self.interval = max(1, int(interval))
+        self.log_path = osp.join(work_dir, filename)
+
+    def _append(self, line):
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    def before_run(self, runner):
+        rank, _ = get_dist_info()
+        if rank != 0:
+            return
+        os.makedirs(osp.dirname(self.log_path), exist_ok=True)
+        self._append("# iter mode message")
+
+    def after_train_iter(self, runner):
+        rank, _ = get_dist_info()
+        if rank != 0:
+            return
+
+        step = int(runner.iter) + 1
+        outputs = getattr(runner, "outputs", {}) or {}
+        log_vars = outputs.get("log_vars", {}) or {}
+
+        nonfinite_pairs = []
+        for k, v in log_vars.items():
+            try:
+                fv = float(v)
+                if not math.isfinite(fv):
+                    nonfinite_pairs.append((k, fv))
+            except Exception:
+                continue
+
+        loss_obj = outputs.get("loss", None)
+        loss_nonfinite = False
+        if torch.is_tensor(loss_obj):
+            loss_nonfinite = not torch.isfinite(loss_obj).all().item()
+
+        if step % self.interval == 0:
+            stable_pairs = []
+            for k, v in sorted(log_vars.items()):
+                try:
+                    stable_pairs.append(f"{k}={float(v):.6f}")
+                except Exception:
+                    continue
+            if stable_pairs:
+                self._append(f"{step} info " + " ".join(stable_pairs))
+
+        if nonfinite_pairs or loss_nonfinite:
+            sample_indices = _extract_sample_indices_from_batch(
+                getattr(runner, "data_batch", {}),
+                max_items=16,
+            )
+            msg = (
+                f"{step} nonfinite "
+                f"loss_nonfinite={loss_nonfinite} "
+                f"nonfinite_log_vars={nonfinite_pairs} "
+                f"sample_idx={sample_indices}"
+            )
+            self._append(msg)
+            runner.logger.error(msg)
 
 
 def custom_train_detector(
@@ -166,6 +257,14 @@ def custom_train_detector(
         cfg.get("momentum_config", None),
     )
     runner.register_hook(_EnsureDataTimeHook(), priority="ABOVE_NORMAL")
+    if cfg.get("enable_numeric_debug_hook", True):
+        runner.register_hook(
+            _NumericDebugHook(
+                work_dir=cfg.work_dir,
+                interval=cfg.get("numeric_debug_interval", 50),
+            ),
+            priority="LOW",
+        )
 
     # register profiler hook
     # trace_config = dict(type='tb_trace', dir_name='work_dir')
