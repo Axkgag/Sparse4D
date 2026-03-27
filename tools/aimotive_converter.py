@@ -344,7 +344,7 @@ def main():
     parser.add_argument(
         "--info_prefix",
         type=str,
-        default="data/aimotive_anno_pkls/aimotive",
+        default="data/aimotive_anno_pkls/aimotive_tl",
         help="Output file prefix, final file is {prefix}_infos_{split}.pkl",
     )
     parser.add_argument(

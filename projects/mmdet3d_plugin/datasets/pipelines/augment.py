@@ -44,9 +44,15 @@ class ResizeCropFlipImage(object):
         if origin_dtype != np.uint8:
             min_value = img.min()
             max_vaule = img.max()
-            scale = 255 / (max_vaule - min_value)
-            img = (img - min_value) * scale
-            img = np.uint8(img)
+            dynamic_range = float(max_vaule - min_value)
+            # Guard against flat/invalid ranges that can trigger divide-by-zero.
+            if (not np.isfinite(dynamic_range)) or dynamic_range < 1e-6:
+                scale = None
+                img = np.zeros_like(img, dtype=np.uint8)
+            else:
+                scale = 255.0 / dynamic_range
+                img = (img - min_value) * scale
+                img = np.uint8(img)
         img = Image.fromarray(img)
         img = img.resize(resize_dims).crop(crop)
         if flip:
@@ -55,7 +61,10 @@ class ResizeCropFlipImage(object):
         img = np.array(img).astype(np.float32)
         if origin_dtype != np.uint8:
             img = img.astype(np.float32)
-            img = img / scale + min_value
+            if scale is None:
+                img.fill(float(min_value))
+            else:
+                img = img / scale + min_value
 
         transform_matrix = np.eye(3)
         transform_matrix[:2, :2] *= resize

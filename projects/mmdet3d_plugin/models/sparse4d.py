@@ -106,7 +106,9 @@ class Sparse4D(BaseDetector):
             )
 
     @auto_fp16(apply_to=("img",), out_fp32=True)
-    def extract_feat(self, img, return_depth=False, metas=None):
+    def extract_feat(self, img, return_depth=False, metas=None, debug_finite=False):
+        if debug_finite and isinstance(metas, dict):
+            _check_finite("input:img", img, metas)
         bs = img.shape[0]
         if img.dim() == 5:  # multi-view
             num_cams = img.shape[1]
@@ -119,12 +121,18 @@ class Sparse4D(BaseDetector):
             feature_maps = self.img_backbone(img, num_cams, metas=metas)
         else:
             feature_maps = self.img_backbone(img)
+        if debug_finite and isinstance(metas, dict):
+            _check_finite("feature_maps:backbone_out", feature_maps, metas)
         if self.img_neck is not None:
             feature_maps = list(self.img_neck(feature_maps))
+            if debug_finite and isinstance(metas, dict):
+                _check_finite("feature_maps:neck_out", feature_maps, metas)
         for i, feat in enumerate(feature_maps):
             feature_maps[i] = torch.reshape(
                 feat, (bs, num_cams) + feat.shape[1:]
             )
+        if debug_finite and isinstance(metas, dict):
+            _check_finite("feature_maps:reshaped", feature_maps, metas)
         if return_depth and self.depth_branch is not None:
             depths = self.depth_branch(feature_maps, metas.get("focal"))
         else:
@@ -143,7 +151,9 @@ class Sparse4D(BaseDetector):
             return self.forward_test(img, **data)
 
     def forward_train(self, img, **data):
-        feature_maps, depths = self.extract_feat(img, True, data)
+        feature_maps, depths = self.extract_feat(
+            img, True, data, debug_finite=True
+        )
         _check_finite("feature_maps", feature_maps, data)
         if depths is not None:
             _check_finite("depths", depths, data)
