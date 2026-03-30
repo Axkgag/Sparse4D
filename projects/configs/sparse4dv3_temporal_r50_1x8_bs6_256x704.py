@@ -337,7 +337,13 @@ train_pipeline = [
             "gt_bboxes_3d",
             "gt_labels_3d",
         ],
-        meta_keys=["T_global", "T_global_inv", "timestamp", "instance_id"],
+        meta_keys=[
+            "T_global",
+            "T_global_inv",
+            "timestamp",
+            "instance_id",
+            "sample_idx",
+        ],
     ),
 ]
 test_pipeline = [
@@ -353,7 +359,7 @@ test_pipeline = [
             "projection_mat",
             "image_wh",
         ],
-        meta_keys=["T_global", "T_global_inv", "timestamp"],
+        meta_keys=["T_global", "T_global_inv", "timestamp", "sample_idx"],
     ),
 ]
 

@@ -2,6 +2,7 @@
 from inspect import signature
 
 import torch
+import torch.distributed as dist
 
 from mmcv.runner import force_fp32, auto_fp16
 from mmcv.utils import build_from_cfg
@@ -36,6 +37,19 @@ def _iter_tensors(obj):
 
 
 def _extract_sample_indices(data, max_items=8):
+    sample_indices = []
+
+    # Optional direct field fallback.
+    raw_sid = data.get("sample_idx", None)
+    if raw_sid is not None:
+        if torch.is_tensor(raw_sid):
+            raw_sid = raw_sid.detach().cpu().reshape(-1).tolist()
+        if not isinstance(raw_sid, (list, tuple)):
+            raw_sid = [raw_sid]
+        for sid in raw_sid:
+            if sid is not None:
+                sample_indices.append(str(sid))
+
     img_metas = data.get("img_metas", [])
     if hasattr(img_metas, "data"):
         img_metas = img_metas.data
@@ -44,14 +58,27 @@ def _extract_sample_indices(data, max_items=8):
     if isinstance(img_metas, list) and len(img_metas) == 1 and isinstance(img_metas[0], list):
         img_metas = img_metas[0]
 
-    sample_indices = []
     if isinstance(img_metas, list):
         for meta in img_metas:
             if isinstance(meta, dict):
                 sid = meta.get("sample_idx", None)
                 if sid is not None:
                     sample_indices.append(str(sid))
-    return sample_indices[:max_items]
+    # De-duplicate while keeping order.
+    uniq = []
+    for sid in sample_indices:
+        if sid not in uniq:
+            uniq.append(sid)
+    return uniq[:max_items]
+
+
+def _get_rank():
+    if dist.is_available() and dist.is_initialized():
+        try:
+            return int(dist.get_rank())
+        except Exception:
+            return -1
+    return -1
 
 
 def _check_finite(name, obj, data):
@@ -60,12 +87,18 @@ def _check_finite(name, obj, data):
             continue
         if not torch.isfinite(tensor).all():
             det = tensor.detach()
-            bad_count = int((~torch.isfinite(det)).sum().item())
+            finite_mask = torch.isfinite(det)
+            bad_count = int((~finite_mask).sum().item())
+            nan_count = int(torch.isnan(det).sum().item())
+            inf_count = int(torch.isinf(det).sum().item())
             total = int(det.numel())
             sample_indices = _extract_sample_indices(data)
+            rank = _get_rank()
             msg = (
                 f"Non-finite detected in {name}: bad={bad_count}/{total}, "
-                f"shape={tuple(det.shape)}, dtype={det.dtype}, sample_idx={sample_indices}"
+                f"nan={nan_count}, inf={inf_count}, "
+                f"shape={tuple(det.shape)}, dtype={det.dtype}, "
+                f"rank={rank}, sample_idx={sample_indices}"
             )
             raise FloatingPointError(msg)
 
@@ -117,6 +150,8 @@ class Sparse4D(BaseDetector):
             num_cams = 1
         if self.use_grid_mask:
             img = self.grid_mask(img)
+            if debug_finite and isinstance(metas, dict):
+                _check_finite("input:img_after_gridmask", img, metas)
         if "metas" in signature(self.img_backbone.forward).parameters:
             feature_maps = self.img_backbone(img, num_cams, metas=metas)
         else:
@@ -138,7 +173,11 @@ class Sparse4D(BaseDetector):
         else:
             depths = None
         if self.use_deformable_func:
+            if debug_finite and isinstance(metas, dict):
+                _check_finite("feature_maps:before_format", feature_maps, metas)
             feature_maps = feature_maps_format(feature_maps)
+            if debug_finite and isinstance(metas, dict):
+                _check_finite("feature_maps:formatted", feature_maps, metas)
         if return_depth:
             return feature_maps, depths
         return feature_maps
