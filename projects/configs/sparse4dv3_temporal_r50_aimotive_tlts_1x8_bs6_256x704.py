@@ -12,21 +12,21 @@ plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
 dist_params = dict(backend="nccl")
 log_level = "INFO"
-work_dir = None
+work_dir = '/model'
 
 total_batch_size = 48
 num_gpus = 8
 batch_size = total_batch_size // num_gpus
 # Adjust this according to your train set size.
-num_iters_per_epoch = int(30000 // (num_gpus * batch_size))
+num_iters_per_epoch = int(29945 // (num_gpus * batch_size))
 num_epochs = 100
-checkpoint_epoch_interval = 10
+checkpoint_epoch_interval = 20
 
 checkpoint_config = dict(
     interval=num_iters_per_epoch * checkpoint_epoch_interval
 )
 log_config = dict(
-    interval=50,
+    interval=51,
     hooks=[
         dict(type="TextLoggerHook", by_epoch=False),
         dict(type="TensorboardLoggerHook"),
@@ -125,7 +125,7 @@ model = dict(
             type="InstanceBank",
             num_anchor=900,
             embed_dims=embed_dims,
-            anchor="nuscenes_kmeans900.npy",
+            anchor="aimotive_kmeans900.npy",
             anchor_handler=dict(type="SparseBox3DKeyPointsGenerator"),
             num_temp_instances=600 if temporal else -1,
             confidence_decay=0.6,
