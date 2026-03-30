@@ -35,7 +35,8 @@ log_config = dict(
 load_from = None
 resume_from = None
 workflow = [("train", 1)]
-fp16 = dict(loss_scale="dynamic")
+# Disable global fp16 for AiMotive to avoid neck activation overflow.
+fp16 = None
 input_shape = (704, 256)
 
 # ================== AiMotive dataset settings ========================

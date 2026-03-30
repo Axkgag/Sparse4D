@@ -82,6 +82,15 @@ def _get_rank():
     return -1
 
 
+def _set_fp16_enabled(module, enabled):
+    if module is None:
+        return
+    if hasattr(module, "fp16_enabled"):
+        module.fp16_enabled = enabled
+    for child in module.children():
+        _set_fp16_enabled(child, enabled)
+
+
 def _check_finite(name, obj, data):
     for tensor in _iter_tensors(obj):
         if tensor.numel() == 0:
@@ -136,6 +145,10 @@ class Sparse4D(BaseDetector):
             self.depth_branch = build_from_cfg(depth_branch, PLUGIN_LAYERS)
         else:
             self.depth_branch = None
+        if self.force_fp32_feat:
+            # Disable module-level auto-fp16 switches on backbone/neck.
+            _set_fp16_enabled(self.img_backbone, False)
+            _set_fp16_enabled(getattr(self, "img_neck", None), False)
         if use_grid_mask:
             self.grid_mask = GridMask(
                 True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7
