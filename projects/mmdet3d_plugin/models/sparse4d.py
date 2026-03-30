@@ -3,6 +3,7 @@ from inspect import signature
 
 import torch
 import torch.distributed as dist
+from torch.cuda.amp.autocast_mode import autocast
 
 from mmcv.runner import force_fp32, auto_fp16
 from mmcv.utils import build_from_cfg
@@ -117,6 +118,7 @@ class Sparse4D(BaseDetector):
         use_grid_mask=True,
         use_deformable_func=False,
         depth_branch=None,
+        force_fp32_feat=False,
     ):
         super(Sparse4D, self).__init__(init_cfg=init_cfg)
         if pretrained is not None:
@@ -129,6 +131,7 @@ class Sparse4D(BaseDetector):
         if use_deformable_func:
             assert DAF_VALID, "deformable_aggregation needs to be set up."
         self.use_deformable_func = use_deformable_func
+        self.force_fp32_feat = force_fp32_feat
         if depth_branch is not None:
             self.depth_branch = build_from_cfg(depth_branch, PLUGIN_LAYERS)
         else:
@@ -152,16 +155,33 @@ class Sparse4D(BaseDetector):
             img = self.grid_mask(img)
             if debug_finite and isinstance(metas, dict):
                 _check_finite("input:img_after_gridmask", img, metas)
-        if "metas" in signature(self.img_backbone.forward).parameters:
-            feature_maps = self.img_backbone(img, num_cams, metas=metas)
+
+        if self.force_fp32_feat:
+            with autocast(enabled=False):
+                img_backbone = img.float()
+                if "metas" in signature(self.img_backbone.forward).parameters:
+                    backbone_maps = self.img_backbone(
+                        img_backbone, num_cams, metas=metas
+                    )
+                else:
+                    backbone_maps = self.img_backbone(img_backbone)
+                if self.img_neck is not None:
+                    feature_maps = list(self.img_neck(backbone_maps))
+                else:
+                    feature_maps = backbone_maps
         else:
-            feature_maps = self.img_backbone(img)
+            if "metas" in signature(self.img_backbone.forward).parameters:
+                backbone_maps = self.img_backbone(img, num_cams, metas=metas)
+            else:
+                backbone_maps = self.img_backbone(img)
+            if self.img_neck is not None:
+                feature_maps = list(self.img_neck(backbone_maps))
+            else:
+                feature_maps = backbone_maps
+
         if debug_finite and isinstance(metas, dict):
-            _check_finite("feature_maps:backbone_out", feature_maps, metas)
-        if self.img_neck is not None:
-            feature_maps = list(self.img_neck(feature_maps))
-            if debug_finite and isinstance(metas, dict):
-                _check_finite("feature_maps:neck_out", feature_maps, metas)
+            _check_finite("feature_maps:backbone_out", backbone_maps, metas)
+            _check_finite("feature_maps:neck_out", feature_maps, metas)
         for i, feat in enumerate(feature_maps):
             feature_maps[i] = torch.reshape(
                 feat, (bs, num_cams) + feat.shape[1:]

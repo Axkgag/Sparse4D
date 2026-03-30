@@ -94,6 +94,7 @@ model = dict(
     type="Sparse4D",
     use_grid_mask=True,
     use_deformable_func=use_deformable_func,
+    force_fp32_feat=True,
     img_backbone=dict(
         type="ResNet",
         depth=50,
