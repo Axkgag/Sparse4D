@@ -56,6 +56,8 @@ class AiMotiveTLTSDataset(Dataset):
         min_box_size: float = 1e-2,
         max_box_size: float = 20.0,
         max_abs_velocity: float = 5.0,
+        eval_match_dist_thr: float = 2.0,
+        num_classes: Optional[int] = None,
         lazy_init: bool = False,
     ):
         super().__init__()
@@ -77,12 +79,17 @@ class AiMotiveTLTSDataset(Dataset):
         self.min_box_size = float(min_box_size)
         self.max_box_size = float(max_box_size)
         self.max_abs_velocity = float(max_abs_velocity)
+        self.eval_match_dist_thr = float(eval_match_dist_thr)
         self.current_aug = None
         self.last_id = None
 
         self.cam_order = cam_order if cam_order is not None else self.DEFAULT_CAM_ORDER
 
-        self.CLASSES = tuple(classes) if classes is not None else self._default_classes(object_type)
+        self.CLASSES = self._resolve_classes(
+            object_type=object_type,
+            classes=classes,
+            num_classes=num_classes,
+        )
         self.cat2id = {name: i for i, name in enumerate(self.CLASSES)}
 
         self.pipeline = Compose(pipeline) if pipeline is not None else None
@@ -105,6 +112,28 @@ class AiMotiveTLTSDataset(Dataset):
         if object_type == "traffic_light":
             return ("red", "red_yellow", "yellow", "green", "unknown")
         return ("unknown",)
+
+    @staticmethod
+    def _resolve_classes(
+        object_type: str,
+        classes: Optional[List[str]],
+        num_classes: Optional[int],
+    ) -> Tuple[str, ...]:
+        if classes is not None:
+            resolved = tuple(str(x) for x in classes)
+            if num_classes is not None and int(num_classes) != len(resolved):
+                raise ValueError(
+                    f"num_classes={num_classes} does not match len(class_names)={len(resolved)}"
+                )
+            return resolved
+
+        if object_type == "traffic_light" and num_classes is not None:
+            if int(num_classes) == 3:
+                return ("red", "yellow", "green")
+            if int(num_classes) == 5:
+                return ("red", "red_yellow", "yellow", "green", "unknown")
+
+        return AiMotiveTLTSDataset._default_classes(object_type)
 
     def __len__(self) -> int:
         return len(self.data_infos)
@@ -393,10 +422,17 @@ class AiMotiveTLTSDataset(Dataset):
             gt_bboxes_3d if gt_bboxes_3d is not None else np.zeros((0, 9)),
             dtype=np.float32,
         )
-        labels = np.asarray(
-            gt_labels_3d if gt_labels_3d is not None else np.zeros((0,)),
-            dtype=np.int64,
-        )
+        if gt_names is not None:
+            names_arr = np.asarray(gt_names, dtype=object)
+            labels = np.asarray(
+                [self.cat2id.get(self._normalize_class_name(x), -1) for x in names_arr],
+                dtype=np.int64,
+            )
+        else:
+            labels = np.asarray(
+                gt_labels_3d if gt_labels_3d is not None else np.zeros((0,)),
+                dtype=np.int64,
+            )
 
         if boxes.ndim == 1:
             boxes = boxes[None, :]
@@ -450,7 +486,10 @@ class AiMotiveTLTSDataset(Dataset):
         else:
             names = np.asarray(gt_names, dtype=object)
             if names.shape[0] >= keep.shape[0]:
-                names = names[: keep.shape[0]][keep]
+                names = np.asarray(
+                    [self._normalize_class_name(x) for x in names[: keep.shape[0]][keep]],
+                    dtype=object,
+                )
             else:
                 names = np.asarray([self.CLASSES[i] for i in labels], dtype=object)
 
@@ -468,6 +507,15 @@ class AiMotiveTLTSDataset(Dataset):
             "gt_names": np.asarray(names, dtype=object),
             "instance_inds": np.ascontiguousarray(ids, dtype=np.int64),
         }
+
+    def _normalize_class_name(self, name: Any) -> str:
+        norm = str(name).lower().strip()
+        if self.object_type == "traffic_light":
+            if norm == "red_yellow" and "red_yellow" not in self.cat2id:
+                return "red"
+            if norm == "amber":
+                return "yellow"
+        return norm
 
     def evaluate(
         self,
@@ -493,7 +541,7 @@ class AiMotiveTLTSDataset(Dataset):
             )
 
         metric_prefix = f"{result_names[0]}_AiMotive"
-        match_dist_thr = 2.0
+        match_dist_thr = float(self.eval_match_dist_thr)
         cls_records = {i: [] for i in range(len(self.CLASSES))}
         num_gts = {i: 0 for i in range(len(self.CLASSES))}
 
