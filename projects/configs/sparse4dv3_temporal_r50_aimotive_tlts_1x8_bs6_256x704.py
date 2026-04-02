@@ -264,7 +264,7 @@ train_pipeline = [
     dict(type="LoadMultiViewImageFromFiles", to_float32=True),
     dict(type="ResizeCropFlipImage"),
     dict(type="BBoxRotation"),
-    dict(type="PhotoMetricDistortionMultiViewImage"),
+    # dict(type="PhotoMetricDistortionMultiViewImage"),
     dict(type="NormalizeMultiviewImage", **img_norm_cfg),
     dict(
         type="CircleObjectRangeFilter",
@@ -374,7 +374,7 @@ data = dict(
 # ================== training ========================
 optimizer = dict(
     type="AdamW",
-    lr=6e-4,
+    lr=2e-4,
     weight_decay=0.001,
     paramwise_cfg=dict(
         custom_keys={
@@ -386,7 +386,7 @@ optimizer_config = dict(grad_clip=dict(max_norm=25, norm_type=2))
 lr_config = dict(
     policy="CosineAnnealing",
     warmup="linear",
-    warmup_iters=500,
+    warmup_iters=1000,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
