@@ -256,7 +256,9 @@ def custom_train_detector(
         cfg.log_config,
         cfg.get("momentum_config", None),
     )
-    runner.register_hook(_EnsureDataTimeHook(), priority="ABOVE_NORMAL")
+    # Ensure this runs after IterTimerHook fills `time`/`data_time` fields
+    # but before logger hooks read the log buffer.
+    runner.register_hook(_EnsureDataTimeHook(), priority="BELOW_NORMAL")
     if cfg.get("enable_numeric_debug_hook", True):
         runner.register_hook(
             _NumericDebugHook(

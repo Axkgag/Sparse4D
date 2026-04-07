@@ -12,7 +12,7 @@ plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
 dist_params = dict(backend="nccl")
 log_level = "INFO"
-work_dir = None
+work_dir = "/model"
 
 total_batch_size = 48
 num_gpus = 8
