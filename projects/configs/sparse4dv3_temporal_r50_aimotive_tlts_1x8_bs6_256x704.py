@@ -261,7 +261,7 @@ img_norm_cfg = dict(
 )
 
 train_pipeline = [
-    dict(type="LoadMultiViewImageFromFiles", to_float32=True),
+    dict(type="LoadMultiViewImageFromFiles", to_float32=True, undistort=True),
     dict(type="ResizeCropFlipImage"),
     dict(type="BBoxRotation"),
     # dict(type="PhotoMetricDistortionMultiViewImage"),
@@ -294,7 +294,7 @@ train_pipeline = [
 ]
 
 test_pipeline = [
-    dict(type="LoadMultiViewImageFromFiles", to_float32=True),
+    dict(type="LoadMultiViewImageFromFiles", to_float32=True, undistort=True),
     dict(type="ResizeCropFlipImage"),
     dict(type="NormalizeMultiviewImage", **img_norm_cfg),
     dict(type="NuScenesSparse4DAdaptor"),
@@ -397,7 +397,7 @@ runner = dict(
 
 # ================== eval ========================
 vis_pipeline = [
-    dict(type="LoadMultiViewImageFromFiles", to_float32=True),
+    dict(type="LoadMultiViewImageFromFiles", to_float32=True, undistort=True),
     dict(
         type="Collect",
         keys=["img"],

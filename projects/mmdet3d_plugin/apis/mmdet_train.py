@@ -42,7 +42,9 @@ class _EnsureDataTimeHook(Hook):
     """Minimal safeguard for mmcv TextLoggerHook expecting data_time."""
 
     def after_train_iter(self, runner):
-        if "time" in runner.log_buffer.output and "data_time" not in runner.log_buffer.output:
+        if "time" not in runner.log_buffer.output:
+            runner.log_buffer.output["time"] = 0.0
+        if "data_time" not in runner.log_buffer.output:
             runner.log_buffer.output["data_time"] = 0.0
 
 
@@ -256,9 +258,9 @@ def custom_train_detector(
         cfg.log_config,
         cfg.get("momentum_config", None),
     )
-    # Ensure this runs after IterTimerHook fills `time`/`data_time` fields
-    # but before logger hooks read the log buffer.
-    runner.register_hook(_EnsureDataTimeHook(), priority="BELOW_NORMAL")
+    # Ensure this runs after IterTimerHook (LOW=70) fills timing fields
+    # but before logger hooks (VERY_LOW=90) read the log buffer.
+    runner.register_hook(_EnsureDataTimeHook(), priority=80)
     if cfg.get("enable_numeric_debug_hook", True):
         runner.register_hook(
             _NumericDebugHook(
