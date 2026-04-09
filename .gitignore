@@ -4,6 +4,8 @@
 *.pkl
 *.so
 *.o
+
+/.github
 /work_dirs
 __pycache__/
 logs/
